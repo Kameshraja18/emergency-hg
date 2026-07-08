@@ -54,6 +54,7 @@ Streamlit Cloud cannot use the local desktop webcam loop directly. The app now s
 1. Open the repository on Streamlit Cloud.
 2. Set the main file to `main.py`.
 3. Use the camera snapshot or image upload UI.
+4. Keep `runtime.txt` in the repo so Streamlit Cloud uses Python 3.11 instead of 3.14.
 
 If you want the original full live-webcam experience, run the desktop mode locally with `python main.py`.
 
