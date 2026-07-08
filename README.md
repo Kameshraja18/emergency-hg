@@ -58,6 +58,8 @@ Streamlit Cloud cannot use the local desktop webcam loop directly. The app now s
 
 If you want the original full live-webcam experience, run the desktop mode locally with `python main.py`.
 
+If you run the local desktop mode and want the OpenCV window behavior, install `opencv-python` in your local environment. The repository defaults to `opencv-python-headless` so Streamlit Cloud can import `cv2` reliably.
+
 ## GitHub hosting
 
 This project is ready to live as a GitHub source repository. A GitHub Actions workflow will install the Python dependencies and syntax-check the main scripts on every push and pull request.
