@@ -2,11 +2,22 @@ import cv2
 import mediapipe as mp
 from gtts import gTTS
 import os
-import pygame
 import time
 import collections
 import json
+import tempfile
+from pathlib import Path
 from twilio.rest import Client
+
+try:
+    import streamlit as st
+except Exception:
+    st = None
+
+try:
+    import pygame
+except Exception:
+    pygame = None
 
 # Optional: load variables from .env if present
 try:
@@ -77,21 +88,47 @@ else:
 # Initialize pygame for audio
 # -----------------------------
 AUDIO_ENABLED = True
-try:
-    pygame.mixer.init()
-except Exception as e:
-    print(f"[Audio] pygame.mixer.init() failed: {e}. Voice disabled.")
+if pygame is None:
     AUDIO_ENABLED = False
+else:
+    try:
+        pygame.mixer.init()
+    except Exception as e:
+        print(f"[Audio] pygame.mixer.init() failed: {e}. Voice disabled.")
+        AUDIO_ENABLED = False
+
+def _is_streamlit_runtime() -> bool:
+    if st is None:
+        return False
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
+
+def _tts_to_file(message: str) -> str:
+    tts = gTTS(text=message, lang='ta')
+    tmp_dir = Path(tempfile.gettempdir())
+    out_path = tmp_dir / f"emergency_hg_tts_{int(time.time() * 1000)}.mp3"
+    tts.save(str(out_path))
+    return str(out_path)
 
 def speak_message_tamil(message: str) -> bool:
     """Synthesize and play a Tamil message using gTTS and pygame.
     Returns True on success, False otherwise.
     """
     try:
-        tts = gTTS(text=message, lang='ta')
-        out_path = "output.mp3"
-        tts.save(out_path)
-        if not AUDIO_ENABLED:
+        out_path = _tts_to_file(message)
+        if _is_streamlit_runtime() and st is not None:
+            with open(out_path, 'rb') as audio_file:
+                st.audio(audio_file.read(), format='audio/mp3')
+            try:
+                os.remove(out_path)
+            except Exception:
+                pass
+            return True
+
+        if not AUDIO_ENABLED or pygame is None:
             print(f"[Audio] Saved TTS to {out_path} (playback disabled)")
             return True
 
@@ -280,6 +317,8 @@ def log_event(gesture:int, message:str, sms_sent:bool, voice_played:bool):
 def generate_beep(duration=0.15, freq=880):
     if not (AUDIO_ENABLED and BEEP_ENABLED):
         return
+    if pygame is None:
+        return
     try:
         import math, array
         sample_rate = 22050
@@ -340,206 +379,243 @@ def is_stable(buf: collections.deque, candidate: int) -> bool:
     med = median_value(buf)
     return ratio >= STABLE_RATIO and med == candidate
 
-print("[Init] SMS enabled:" , SMS_ENABLED)
-print("[Init] Voice enabled:", AUDIO_ENABLED)
-loaded_cfg = load_config()
-if not loaded_cfg:
-    print("[Config] Using defaults (no config.json).")
-ensure_event_log_header()
-show_help()
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("[Camera] Frame grab failed. Exiting loop.")
-        break
-
-    frame = cv2.flip(frame, 1)
+def process_frame(frame):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
-
     per_frame_count = 0
+    counts = []
+
     if results.multi_hand_landmarks:
-        # Try to align handedness with landmarks if available
         handedness_list = []
         if getattr(results, 'multi_handedness', None):
             handedness_list = [h.classification[0].label for h in results.multi_handedness]
 
-        counts = []
         for idx, hand_landmarks in enumerate(results.multi_hand_landmarks):
             label = handedness_list[idx] if idx < len(handedness_list) else 'Right'
-            cnt = count_fingers(hand_landmarks, label)
-            cnt = max(0, min(5, cnt))
+            cnt = max(0, min(5, count_fingers(hand_landmarks, label)))
             counts.append(cnt)
-            # Draw hand landmarks
             mp_draw.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
 
-        # SUM fingers across both hands (cap at 10)
         per_frame_count = min(10, sum(counts)) if counts else 0
-    else:
-        per_frame_count = 0
-    # Activity tracking (hand present if any fingers > 0 or landmarks detected)
-    if results.multi_hand_landmarks:
-        last_activity_time = time.time()
 
-    # Update buffer and compute majority
-    gesture_buffer.append(per_frame_count)
-    mode_count = majority_vote(gesture_buffer)
-    stable = is_stable(gesture_buffer, mode_count)
+    return frame, per_frame_count, counts, results
 
-    # On-screen overlays
-    overlay_msg = messages_tamil.get(mode_count, "")
-    # Display per-hand counts if available
-    per_hand_display = ''
-    if 'counts' in locals() and counts:
-        per_hand_display = ' | Hands:' + '+'.join(str(c) for c in counts)
-    status_line = (
-        f"Total:{mode_count} | Stable:{'Y' if stable else 'N'} | Dwell:{DWELL_WINDOWS} | SMS:{'Y' if SMS_ENABLED else 'N'} | "
-        f"Voice:{'Y' if VOICE_ENABLED and AUDIO_ENABLED else 'N'} | Beep:{'Y' if BEEP_ENABLED else 'N'} | Buf:{buffer_size}" + per_hand_display
-    )
-    cv2.putText(frame, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-    if overlay_msg:
-        cv2.putText(frame, overlay_msg, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+def run_desktop_app():
+    global last_activity_time, stable_candidate, stable_candidate_count, last_sent_gesture, last_any_trigger_time, VOICE_ENABLED, SMS_ENABLED, BEEP_ENABLED, LOGGING_ENABLED, HIGH_CONTRAST, DWELL_WINDOWS
 
-    # Compute severity color
-    sev = SEVERITY.get(mode_count, "none")
-    if sev == "emergency":
-        base_color = (0,0,255)  # Red (BGR)
-    elif sev in ("doctor","pain"):
-        base_color = (0,140,255)  # Orange-ish
-    elif sev in ("help","family","medicine"):
-        base_color = (0,255,255)  # Yellow
-    else:
-        base_color = (0,255,0)    # Green
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[Camera] Failed to open default camera (index 0). Exiting.")
+        raise SystemExit(1)
 
-    # High contrast adjustments
-    text_color = (255,255,255) if HIGH_CONTRAST else base_color
-    bg_color = (0,0,0) if HIGH_CONTRAST else None
-    thickness = 2 if HIGH_CONTRAST else 1
+    print("[Init] SMS enabled:", SMS_ENABLED)
+    print("[Init] Voice enabled:", AUDIO_ENABLED)
+    loaded_cfg = load_config()
+    if not loaded_cfg:
+        print("[Config] Using defaults (no config.json).")
+    ensure_event_log_header()
+    show_help()
 
-    # Redraw status line with chosen color
-    cv2.putText(frame, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6 if not HIGH_CONTRAST else 0.75, text_color, thickness+1)
-    if overlay_msg:
-        cv2.putText(frame, overlay_msg, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75 if not HIGH_CONTRAST else 0.9, text_color, thickness+1)
-
-    # Inactivity overlay
-    idle_time = time.time() - last_activity_time
-    if idle_time >= INACTIVITY_WARNING_SECONDS:
-        warn_msg = "கையை கேமராவிற்கு முன்னர் வைத்திருங்கள்"  # Place your hand before camera
-        if idle_time >= INACTIVITY_ALERT_SECONDS:
-            warn_msg = "உதவி தேவைதா? கை காணப்படவில்லை"  # Need help? Hand not detected
-        cv2.putText(frame, warn_msg, (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6 if not HIGH_CONTRAST else 0.75, (0,0,255) if idle_time >= INACTIVITY_ALERT_SECONDS else (0,165,255), 2)
-
-    # Dwell logic: require repeated stable windows
-    if stable:
-        if mode_count == stable_candidate:
-            # Already same candidate
-            pass
-        else:
-            stable_candidate = mode_count
-            stable_candidate_count = 0
-        # Increment when stable window matches
-        stable_candidate_count += 1
-    else:
-        # Reset if stability lost
-        if mode_count != stable_candidate:
-            stable_candidate = None
-            stable_candidate_count = 0
-
-    dwell_met = stable and stable_candidate == mode_count and stable_candidate_count >= DWELL_WINDOWS
-
-    # Emergency visual border flash when dwell satisfied
-    if dwell_met and mode_count == 10:
-        if int(time.time()*4) % 2 == 0:  # Flashing
-            cv2.rectangle(frame, (0,0), (frame.shape[1]-1, frame.shape[0]-1), (0,0,255), 6)
-
-    # Trigger actions when dwell (not just first stable) and new/ratelimited
-    now = time.time()
-    if dwell_met and mode_count in messages_tamil and overlay_msg:
-        cooldown_ok = (now - last_sent_time.get(mode_count, 0.0)) >= COOLDOWN_SECONDS
-        global_interval_ok = (now - last_any_trigger_time) >= GLOBAL_MIN_INTERVAL
-        not_repeated = (mode_count != last_sent_gesture)
-        if (cooldown_ok and global_interval_ok) or not_repeated:
-            message = messages_tamil[mode_count]
-            print(f"[Gesture] Detected {mode_count} -> {message}")
-            voice_played = False
-            sms_sent = False
-            if VOICE_ENABLED:
-                if speak_message_tamil(message):
-                    voice_played = True
-            if BEEP_ENABLED:
-                generate_beep()
-            if SMS_ENABLED and twilio_client is not None:
-                try:
-                    twilio_client.messages.create(
-                        body=message,
-                        from_=twilio_phone_number,
-                        to=destination_phone_number
-                    )
-                    print("[Twilio] SMS sent.")
-                    sms_sent = True
-                except Exception as e:
-                    print(f"[Twilio] Failed to send SMS: {e}")
-            log_event(mode_count, message, sms_sent, voice_played)
-            last_sent_gesture = mode_count
-            last_sent_time[mode_count] = now
-            last_any_trigger_time = now
-
-    cv2.imshow("கை சைகை கண்டறிதல்", frame)
-
-    key = cv2.waitKey(1) & 0xFF
-    if key == ord('q'):
-        break
-    elif key == ord('s'):
-        SMS_ENABLED = not SMS_ENABLED
-        print(f"[Toggle] SMS {'enabled' if SMS_ENABLED else 'disabled'}.")
-    elif key == ord('v'):
-        VOICE_ENABLED = not VOICE_ENABLED
-        print(f"[Toggle] Voice {'enabled' if VOICE_ENABLED else 'disabled'}.")
-    elif key == ord('r'):
-        last_sent_gesture = None
-        for k in last_sent_time:
-            last_sent_time[k] = 0.0
-        print("[Reset] Last sent gesture and timers cleared.")
-    elif key == ord('+') or key == ord('='):
-        set_buffer_size(buffer_size + 1)
-        print(f"[Buffer] Size -> {buffer_size}")
-    elif key == ord('-') or key == ord('_'):
-        set_buffer_size(buffer_size - 1)
-        print(f"[Buffer] Size -> {buffer_size}")
-    elif key == ord('h'):
-        show_help()
-    elif key == ord('b'):
-        BEEP_ENABLED = not BEEP_ENABLED
-        print(f"[Toggle] Beep {'enabled' if BEEP_ENABLED else 'disabled'}.")
-    elif key == ord('l'):
-        LOGGING_ENABLED = not LOGGING_ENABLED
-        print(f"[Toggle] Logging {'enabled' if LOGGING_ENABLED else 'disabled'}.")
-        if LOGGING_ENABLED:
-            ensure_event_log_header()
-    elif key == ord('c'):
-        load_config()
-    elif key == ord('k'):
-        HIGH_CONTRAST = not HIGH_CONTRAST
-        print(f"[Toggle] High contrast {'enabled' if HIGH_CONTRAST else 'disabled'}.")
-    elif key == ord('d'):
-        DWELL_WINDOWS += 1
-        print(f"[Dwell] Windows required -> {DWELL_WINDOWS}")
-    elif key == ord('D'):
-        DWELL_WINDOWS = max(1, DWELL_WINDOWS - 1)
-        print(f"[Dwell] Windows required -> {DWELL_WINDOWS}")
-
-# -----------------------------
-# Cleanup
-# -----------------------------
-try:
-    hands.close()
-except Exception:
-    pass
-cap.release()
-cv2.destroyAllWindows()
-if AUDIO_ENABLED:
     try:
-        pygame.mixer.quit()
-    except Exception:
-        pass
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[Camera] Frame grab failed. Exiting loop.")
+                break
+
+            frame = cv2.flip(frame, 1)
+            frame, per_frame_count, counts, results = process_frame(frame)
+
+            if results.multi_hand_landmarks:
+                last_activity_time = time.time()
+
+            gesture_buffer.append(per_frame_count)
+            mode_count = majority_vote(gesture_buffer)
+            stable = is_stable(gesture_buffer, mode_count)
+
+            overlay_msg = messages_tamil.get(mode_count, "")
+            per_hand_display = ''
+            if counts:
+                per_hand_display = ' | Hands:' + '+'.join(str(c) for c in counts)
+            status_line = (
+                f"Total:{mode_count} | Stable:{'Y' if stable else 'N'} | Dwell:{DWELL_WINDOWS} | SMS:{'Y' if SMS_ENABLED else 'N'} | "
+                f"Voice:{'Y' if VOICE_ENABLED and AUDIO_ENABLED else 'N'} | Beep:{'Y' if BEEP_ENABLED else 'N'} | Buf:{buffer_size}" + per_hand_display
+            )
+
+            sev = SEVERITY.get(mode_count, "none")
+            if sev == "emergency":
+                base_color = (0, 0, 255)
+            elif sev in ("doctor", "pain"):
+                base_color = (0, 140, 255)
+            elif sev in ("help", "family", "medicine"):
+                base_color = (0, 255, 255)
+            else:
+                base_color = (0, 255, 0)
+
+            text_color = (255, 255, 255) if HIGH_CONTRAST else base_color
+            thickness = 2 if HIGH_CONTRAST else 1
+
+            cv2.putText(frame, status_line, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6 if not HIGH_CONTRAST else 0.75, text_color, thickness + 1)
+            if overlay_msg:
+                cv2.putText(frame, overlay_msg, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.75 if not HIGH_CONTRAST else 0.9, text_color, thickness + 1)
+
+            idle_time = time.time() - last_activity_time
+            if idle_time >= INACTIVITY_WARNING_SECONDS:
+                warn_msg = "கையை கேமராவிற்கு முன்னர் வைத்திருங்கள்"
+                if idle_time >= INACTIVITY_ALERT_SECONDS:
+                    warn_msg = "உதவி தேவைதா? கை காணப்படவில்லை"
+                cv2.putText(frame, warn_msg, (10, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.6 if not HIGH_CONTRAST else 0.75, (0, 0, 255) if idle_time >= INACTIVITY_ALERT_SECONDS else (0, 165, 255), 2)
+
+            if stable:
+                if mode_count == stable_candidate:
+                    pass
+                else:
+                    stable_candidate = mode_count
+                    stable_candidate_count = 0
+                stable_candidate_count += 1
+            else:
+                if mode_count != stable_candidate:
+                    stable_candidate = None
+                    stable_candidate_count = 0
+
+            dwell_met = stable and stable_candidate == mode_count and stable_candidate_count >= DWELL_WINDOWS
+
+            if dwell_met and mode_count == 10 and int(time.time() * 4) % 2 == 0:
+                cv2.rectangle(frame, (0, 0), (frame.shape[1] - 1, frame.shape[0] - 1), (0, 0, 255), 6)
+
+            now = time.time()
+            if dwell_met and mode_count in messages_tamil and overlay_msg:
+                cooldown_ok = (now - last_sent_time.get(mode_count, 0.0)) >= COOLDOWN_SECONDS
+                global_interval_ok = (now - last_any_trigger_time) >= GLOBAL_MIN_INTERVAL
+                not_repeated = (mode_count != last_sent_gesture)
+                if (cooldown_ok and global_interval_ok) or not_repeated:
+                    message = messages_tamil[mode_count]
+                    print(f"[Gesture] Detected {mode_count} -> {message}")
+                    voice_played = False
+                    sms_sent = False
+                    if VOICE_ENABLED:
+                        if speak_message_tamil(message):
+                            voice_played = True
+                    if BEEP_ENABLED:
+                        generate_beep()
+                    if SMS_ENABLED and twilio_client is not None:
+                        try:
+                            twilio_client.messages.create(body=message, from_=twilio_phone_number, to=destination_phone_number)
+                            print("[Twilio] SMS sent.")
+                            sms_sent = True
+                        except Exception as e:
+                            print(f"[Twilio] Failed to send SMS: {e}")
+                    log_event(mode_count, message, sms_sent, voice_played)
+                    last_sent_gesture = mode_count
+                    last_sent_time[mode_count] = now
+                    last_any_trigger_time = now
+
+            cv2.imshow("கை சைகை கண்டறிதல்", frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            elif key == ord('s'):
+                SMS_ENABLED = not SMS_ENABLED
+                print(f"[Toggle] SMS {'enabled' if SMS_ENABLED else 'disabled' }.")
+            elif key == ord('v'):
+                VOICE_ENABLED = not VOICE_ENABLED
+                print(f"[Toggle] Voice {'enabled' if VOICE_ENABLED else 'disabled'}.")
+            elif key == ord('r'):
+                last_sent_gesture = None
+                for k in last_sent_time:
+                    last_sent_time[k] = 0.0
+                print("[Reset] Last sent gesture and timers cleared.")
+            elif key == ord('+') or key == ord('='):
+                set_buffer_size(buffer_size + 1)
+                print(f"[Buffer] Size -> {buffer_size}")
+            elif key == ord('-') or key == ord('_'):
+                set_buffer_size(buffer_size - 1)
+                print(f"[Buffer] Size -> {buffer_size}")
+            elif key == ord('h'):
+                show_help()
+            elif key == ord('b'):
+                BEEP_ENABLED = not BEEP_ENABLED
+                print(f"[Toggle] Beep {'enabled' if BEEP_ENABLED else 'disabled'}.")
+            elif key == ord('l'):
+                LOGGING_ENABLED = not LOGGING_ENABLED
+                print(f"[Toggle] Logging {'enabled' if LOGGING_ENABLED else 'disabled'}.")
+                if LOGGING_ENABLED:
+                    ensure_event_log_header()
+            elif key == ord('c'):
+                load_config()
+            elif key == ord('k'):
+                HIGH_CONTRAST = not HIGH_CONTRAST
+                print(f"[Toggle] High contrast {'enabled' if HIGH_CONTRAST else 'disabled'}.")
+            elif key == ord('d'):
+                DWELL_WINDOWS += 1
+                print(f"[Dwell] Windows required -> {DWELL_WINDOWS}")
+            elif key == ord('D'):
+                DWELL_WINDOWS = max(1, DWELL_WINDOWS - 1)
+                print(f"[Dwell] Windows required -> {DWELL_WINDOWS}")
+    finally:
+        try:
+            hands.close()
+        except Exception:
+            pass
+        cap.release()
+        cv2.destroyAllWindows()
+        if AUDIO_ENABLED and pygame is not None:
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
+
+def run_streamlit_app():
+    if st is None:
+        raise RuntimeError("Streamlit is not installed.")
+
+    st.set_page_config(page_title="Emergency Hand Gesture Assistive Tool", layout="wide")
+    st.title("Emergency Hand Gesture Assistive Tool")
+    st.write("Deployable demo mode for Streamlit Cloud. Upload an image or take a camera snapshot to detect raised fingers.")
+    st.info("Live local webcam capture is only supported when running the desktop app with `python main.py`.")
+
+    uploaded = st.camera_input("Take a snapshot")
+    file_upload = st.file_uploader("Or upload an image", type=["png", "jpg", "jpeg"])
+
+    image_bytes = None
+    if file_upload is not None:
+        image_bytes = file_upload.getvalue()
+    elif uploaded is not None:
+        image_bytes = uploaded.getvalue()
+
+    if image_bytes is None:
+        st.stop()
+
+    import numpy as np
+    img_array = np.frombuffer(image_bytes, dtype=np.uint8)
+    frame = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if frame is None:
+        st.error("Could not decode the image.")
+        st.stop()
+
+    frame = cv2.flip(frame, 1)
+    annotated, per_frame_count, counts, results = process_frame(frame)
+    mode_count = max(0, min(10, per_frame_count))
+    message = messages_tamil.get(mode_count, "")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.image(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB), caption=f"Detected fingers: {mode_count}", use_container_width=True)
+    with col2:
+        st.metric("Total fingers", mode_count)
+        st.write("Per-hand counts:", counts if counts else "No hand detected")
+        st.write("Tamil message:", message if message else "No mapped message")
+
+        if message:
+            if st.button("Play voice output"):
+                speak_message_tamil(message)
+
+def main():
+    if _is_streamlit_runtime():
+        run_streamlit_app()
+    else:
+        run_desktop_app()
+
+if __name__ == "__main__":
+    main()

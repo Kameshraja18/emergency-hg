@@ -1,6 +1,6 @@
-opencv-python
+opencv-python-headless
 mediapipe
 gTTS
-pygame
 twilio
 python-dotenv
+streamlit
