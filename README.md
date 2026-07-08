@@ -1,12 +1,13 @@
 # Hand Gesture Assistive Tool
 
-This app detects hand gestures (raised fingers) via webcam using MediaPipe Hands, speaks a Tamil message via gTTS/pygame, and can optionally send an SMS via Twilio.
+This app detects hand gestures (raised fingers) via webcam using MediaPipe Hands, speaks a Tamil message via gTTS, and can optionally send an SMS via Twilio.
 
 ## Features
 - CPU-friendly MediaPipe-based hand pose detection
 - Stabilized gesture detection with adjustable buffer (3–15)
 - Handedness-aware thumb detection
-- Voice playback (toggle `v`), SMS sending (toggle `s`)
+- Voice playback locally when available; Streamlit demo mode can play browser audio
+- SMS sending (toggle `s` in desktop mode)
 - Rate limiting to avoid spamming (30s per gesture)
 - On-screen overlays and keyboard controls
 
@@ -46,15 +47,21 @@ python main.py
 
 Make sure a webcam is available. Press `q` to quit.
 
+## Streamlit deployment
+
+Streamlit Cloud cannot use the local desktop webcam loop directly. The app now supports a deployable demo mode:
+
+1. Open the repository on Streamlit Cloud.
+2. Set the main file to `main.py`.
+3. Use the camera snapshot or image upload UI.
+
+If you want the original full live-webcam experience, run the desktop mode locally with `python main.py`.
+
 ## GitHub hosting
 
 This project is ready to live as a GitHub source repository. A GitHub Actions workflow will install the Python dependencies and syntax-check the main scripts on every push and pull request.
 
-Because this app depends on a local webcam, it is not a GitHub Pages app. The intended deployment model is:
-
-1. Host the source code on GitHub.
-2. Run the app on a local machine, laptop, or edge device with a camera.
-3. Optionally use GitHub Actions for validation and release automation.
+Because the desktop mode depends on a local webcam, it is not a GitHub Pages app. The deployable Streamlit mode is snapshot-based for cloud use, while the full live-webcam experience remains local.
 
 To publish your local changes to the existing GitHub remote:
 

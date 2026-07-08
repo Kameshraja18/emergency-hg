@@ -1,6 +1,6 @@
 opencv-python
 mediapipe
 gTTS
-pygame
 twilio
 python-dotenv
+streamlit
