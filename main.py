@@ -150,24 +150,39 @@ def speak_message_tamil(message: str) -> bool:
         return False
 
 # -----------------------------
-# MediaPipe Hand Detection Init
+# MediaPipe / camera initialization helpers
 # -----------------------------
-mp_hands = mp.solutions.hands
-hands = mp_hands.Hands(
-    model_complexity=1,
-    min_detection_confidence=0.7,
-    min_tracking_confidence=0.7,
-    max_num_hands=2,
-)
-mp_draw = mp.solutions.drawing_utils
+def initialize_hand_pipeline():
+    """Create MediaPipe hand detection objects lazily.
 
-# -----------------------------
-# Webcam Initialization
-# -----------------------------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("[Camera] Failed to open default camera (index 0). Exiting.")
-    raise SystemExit(1)
+    Streamlit Cloud can import this module without opening a webcam or touching
+    MediaPipe internals until the app actually needs them.
+    """
+    try:
+        mp_solutions = getattr(mp, "solutions", None)
+        if mp_solutions is None:
+            from mediapipe import solutions as mp_solutions
+
+        mp_hands = mp_solutions.hands
+        mp_draw = mp_solutions.drawing_utils
+        hands = mp_hands.Hands(
+            model_complexity=1,
+            min_detection_confidence=0.7,
+            min_tracking_confidence=0.7,
+            max_num_hands=2,
+        )
+        return mp_hands, mp_draw, hands
+    except Exception as e:
+        print(f"[MediaPipe] Failed to initialize hand pipeline: {e}")
+        return None, None, None
+
+
+def initialize_camera():
+    cap = cv2.VideoCapture(0)
+    if not cap.isOpened():
+        print("[Camera] Failed to open default camera (index 0). Exiting.")
+        return None
+    return cap
 
 # -----------------------------
 # Gesture Buffer for Stability
@@ -379,7 +394,7 @@ def is_stable(buf: collections.deque, candidate: int) -> bool:
     med = median_value(buf)
     return ratio >= STABLE_RATIO and med == candidate
 
-def process_frame(frame):
+def process_frame(frame, hands, mp_hands, mp_draw):
     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     results = hands.process(rgb_frame)
     per_frame_count = 0
@@ -403,9 +418,12 @@ def process_frame(frame):
 def run_desktop_app():
     global last_activity_time, stable_candidate, stable_candidate_count, last_sent_gesture, last_any_trigger_time, VOICE_ENABLED, SMS_ENABLED, BEEP_ENABLED, LOGGING_ENABLED, HIGH_CONTRAST, DWELL_WINDOWS
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("[Camera] Failed to open default camera (index 0). Exiting.")
+    mp_hands, mp_draw, hands = initialize_hand_pipeline()
+    if hands is None or mp_hands is None or mp_draw is None:
+        raise SystemExit(1)
+
+    cap = initialize_camera()
+    if cap is None:
         raise SystemExit(1)
 
     print("[Init] SMS enabled:", SMS_ENABLED)
@@ -424,7 +442,7 @@ def run_desktop_app():
                 break
 
             frame = cv2.flip(frame, 1)
-            frame, per_frame_count, counts, results = process_frame(frame)
+            frame, per_frame_count, counts, results = process_frame(frame, hands, mp_hands, mp_draw)
 
             if results.multi_hand_landmarks:
                 last_activity_time = time.time()
@@ -558,7 +576,8 @@ def run_desktop_app():
             hands.close()
         except Exception:
             pass
-        cap.release()
+        if cap is not None:
+            cap.release()
         cv2.destroyAllWindows()
         if AUDIO_ENABLED and pygame is not None:
             try:
@@ -569,6 +588,11 @@ def run_desktop_app():
 def run_streamlit_app():
     if st is None:
         raise RuntimeError("Streamlit is not installed.")
+
+    mp_hands, mp_draw, hands = initialize_hand_pipeline()
+    if hands is None or mp_hands is None or mp_draw is None:
+        st.error("MediaPipe could not be initialized in this environment.")
+        st.stop()
 
     st.set_page_config(page_title="Emergency Hand Gesture Assistive Tool", layout="wide")
     st.title("Emergency Hand Gesture Assistive Tool")
@@ -595,7 +619,7 @@ def run_streamlit_app():
         st.stop()
 
     frame = cv2.flip(frame, 1)
-    annotated, per_frame_count, counts, results = process_frame(frame)
+    annotated, per_frame_count, counts, results = process_frame(frame, hands, mp_hands, mp_draw)
     mode_count = max(0, min(10, per_frame_count))
     message = messages_tamil.get(mode_count, "")
 
@@ -610,6 +634,11 @@ def run_streamlit_app():
         if message:
             if st.button("Play voice output"):
                 speak_message_tamil(message)
+
+    try:
+        hands.close()
+    except Exception:
+        pass
 
 def main():
     if _is_streamlit_runtime():
